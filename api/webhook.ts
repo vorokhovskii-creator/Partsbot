@@ -186,7 +186,8 @@ async function processWithGemini(fileIds: string[]): Promise<string> {
     if (!t || t.trim().length === 0) {
       throw new Error("Gemini вернул пустой ответ");
     }
-    return t.trim();
+    // Gemini may return literal "\t" instead of real tab characters
+    return t.trim().replace(/\\t/g, "\t");
   });
 }
 
