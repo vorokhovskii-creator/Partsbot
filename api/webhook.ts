@@ -100,12 +100,36 @@ const SYSTEM_PROMPT = `Ты помощник автомеханика. Твоя 
 // Gemini call
 // ---------------------------------------------------------------------------
 
+/** Retry helper for transient errors (503, 429, network) */
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isRetryable =
+        message.includes("503") ||
+        message.includes("429") ||
+        message.includes("Service Unavailable") ||
+        message.includes("overloaded") ||
+        message.includes("high demand");
+
+      if (!isRetryable || attempt === maxAttempts) throw err;
+
+      const delayMs = 2000 * attempt; // 2s, 4s
+      console.log(`Gemini attempt ${attempt} failed (${message}), retrying in ${delayMs}ms...`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error("Unreachable");
+}
+
 async function processWithGemini(fileIds: string[]): Promise<string> {
   // Download all photos in parallel
   const photos = await Promise.all(fileIds.map(downloadPhoto));
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.5-flash",
+    model: "gemini-1.5-flash-latest",
     systemInstruction: SYSTEM_PROMPT,
   });
 
@@ -113,19 +137,23 @@ async function processWithGemini(fileIds: string[]): Promise<string> {
     inlineData: { data: p.base64, mimeType: p.mimeType },
   }));
 
-  const result = await model.generateContent([
-    ...imageParts,
-    { text: "Извлеки данные о запчастях со всех приложенных скриншотов." },
-  ]);
+  const text = await withRetry(async () => {
+    const result = await model.generateContent([
+      ...imageParts,
+      { text: "Извлеки данные о запчастях со всех приложенных скриншотов." },
+    ]);
 
-  const response = result.response;
-  const text = response.text();
+    const response = result.response;
+    const t = response.text();
 
-  if (!text || text.trim().length === 0) {
-    throw new Error("Gemini вернул пустой ответ");
-  }
+    if (!t || t.trim().length === 0) {
+      throw new Error("Gemini вернул пустой ответ");
+    }
 
-  return text.trim();
+    return t.trim();
+  });
+
+  return text;
 }
 
 // ---------------------------------------------------------------------------
