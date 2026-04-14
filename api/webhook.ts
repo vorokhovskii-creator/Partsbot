@@ -15,8 +15,8 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL!;
 // Clients
 // ---------------------------------------------------------------------------
 
-const bot = new Telegraf(BOT_TOKEN);
-const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+export const bot = new Telegraf(BOT_TOKEN);
+export const genAI = new GoogleGenerativeAI(GEMINI_KEY);
 
 // ---------------------------------------------------------------------------
 // In-memory state (resets on cold start — see README)
@@ -105,7 +105,7 @@ async function processWithGemini(fileIds: string[]): Promise<string> {
   const photos = await Promise.all(fileIds.map(downloadPhoto));
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-1.5-flash",
+    model: "gemini-2.5-flash",
     systemInstruction: SYSTEM_PROMPT,
   });
 

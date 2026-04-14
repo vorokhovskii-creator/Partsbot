@@ -6,7 +6,7 @@ Telegram-бот для автосервиса: принимает скриншо
 
 - **Runtime:** Node.js + TypeScript
 - **Telegram:** Telegraf
-- **AI:** Google Gemini 1.5 Flash (Vision)
+- **AI:** Google Gemini 2.5 Flash (Vision)
 - **Deploy:** Vercel (serverless, webhook-режим)
 
 ## Как работает
