@@ -73,12 +73,35 @@ async function tgApi(method: string, body: Record<string, unknown>): Promise<unk
   return json;
 }
 
+/** Send multipart/form-data request to Telegram API (for file uploads) */
+async function tgApiForm(method: string, formData: FormData): Promise<unknown> {
+  const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: "POST",
+    body: formData,
+  });
+  const json = await res.json();
+  return json;
+}
+
 async function sendMessage(
   chatId: number,
   text: string,
   extra?: Record<string, unknown>
 ): Promise<void> {
   await tgApi("sendMessage", { chat_id: chatId, text, ...extra });
+}
+
+async function sendDocument(
+  chatId: number,
+  fileBuffer: Buffer,
+  filename: string,
+  caption?: string
+): Promise<void> {
+  const formData = new FormData();
+  formData.append("chat_id", String(chatId));
+  formData.append("document", new Blob([fileBuffer]), filename);
+  if (caption) formData.append("caption", caption);
+  await tgApiForm("sendDocument", formData);
 }
 
 async function answerCallbackQuery(
@@ -203,10 +226,11 @@ async function handleUpdate(update: any): Promise<void> {
     const chatId = cb.message?.chat?.id as number | undefined;
 
     if (cb.data === "copy_result" && chatId) {
-      await answerCallbackQuery(cb.id, "Скопировано!");
+      await answerCallbackQuery(cb.id, "Отправляю файл!");
       const text = await getLastResult(chatId);
       if (text) {
-        await sendMessage(chatId, text);
+        const tsvBuffer = Buffer.from(text, "utf-8");
+        await sendDocument(chatId, tsvBuffer, "parts.tsv");
       }
     }
     return;
@@ -264,11 +288,28 @@ async function handleUpdate(update: any): Promise<void> {
       const result = await processWithGemini(fileIds);
       await setLastResult(chatId, result);
 
-      await sendMessage(chatId, `\`\`\`\n${result}\n\`\`\``, {
-        parse_mode: "Markdown",
+      // Send .tsv file — tabs are preserved, Google Sheets imports correctly
+      const tsvBuffer = Buffer.from(result, "utf-8");
+      await sendDocument(
+        chatId,
+        tsvBuffer,
+        "parts.tsv",
+        "Готово! Открой файл в Google Sheets или скопируй содержимое."
+      );
+
+      // Also send a text preview with visible column separation
+      const preview = result
+        .split("\n")
+        .map((line) => {
+          const [name, prices] = line.split("\t");
+          return prices ? `${name}  |  ${prices}` : line;
+        })
+        .join("\n");
+
+      await sendMessage(chatId, `Превью:\n\n${preview}`, {
         reply_markup: {
           inline_keyboard: [
-            [{ text: "\u2705 Скопировать", callback_data: "copy_result" }],
+            [{ text: "\u2705 Получить текст для копирования", callback_data: "copy_result" }],
           ],
         },
       });
