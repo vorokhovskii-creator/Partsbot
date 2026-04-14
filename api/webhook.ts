@@ -101,7 +101,7 @@ const SYSTEM_PROMPT = `Ты помощник автомеханика. Твоя 
 // ---------------------------------------------------------------------------
 
 /** Retry helper for transient errors (503, 429, network) */
-async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
@@ -112,11 +112,12 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
         message.includes("429") ||
         message.includes("Service Unavailable") ||
         message.includes("overloaded") ||
-        message.includes("high demand");
+        message.includes("high demand") ||
+        message.includes("RESOURCE_EXHAUSTED");
 
       if (!isRetryable || attempt === maxAttempts) throw err;
 
-      const delayMs = 2000 * attempt; // 2s, 4s
+      const delayMs = 3000 * attempt; // 3s, 6s, 9s
       console.log(`Gemini attempt ${attempt} failed (${message}), retrying in ${delayMs}ms...`);
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -129,7 +130,7 @@ async function processWithGemini(fileIds: string[]): Promise<string> {
   const photos = await Promise.all(fileIds.map(downloadPhoto));
 
   const model = genAI.getGenerativeModel({
-    model: "gemini-1.5-flash-latest",
+    model: "gemini-2.5-flash",
     systemInstruction: SYSTEM_PROMPT,
   });
 
