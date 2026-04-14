@@ -7,6 +7,7 @@ Telegram-бот для автосервиса: принимает скриншо
 - **Runtime:** Node.js + TypeScript
 - **Telegram:** Telegraf
 - **AI:** Google Gemini 2.5 Flash (Vision)
+- **Storage:** Upstash Redis (REST API)
 - **Deploy:** Vercel (serverless, webhook-режим)
 
 ## Как работает
@@ -22,6 +23,8 @@ Telegram-бот для автосервиса: принимает скриншо
 TELEGRAM_BOT_TOKEN=токен от @BotFather
 GEMINI_API_KEY=ключ Google AI Studio (https://aistudio.google.com/apikey)
 WEBHOOK_URL=https://your-project.vercel.app
+UPSTASH_REDIS_REST_URL=https://your-redis.upstash.io
+UPSTASH_REDIS_REST_TOKEN=токен из Upstash Console
 ```
 
 ## Локальный запуск (ngrok)
@@ -87,6 +90,8 @@ vercel
 vercel env add TELEGRAM_BOT_TOKEN
 vercel env add GEMINI_API_KEY
 vercel env add WEBHOOK_URL
+vercel env add UPSTASH_REDIS_REST_URL
+vercel env add UPSTASH_REDIS_REST_TOKEN
 ```
 
 `WEBHOOK_URL` — итоговый URL проекта на Vercel (например `https://partsbot.vercel.app`).
@@ -105,20 +110,26 @@ curl -X POST "https://api.telegram.org/bot<YOUR_TOKEN>/setWebhook" \
   -d '{"url": "https://partsbot.vercel.app/api/webhook"}'
 ```
 
-## Ограничения
+## Хранилище (Upstash Redis)
 
-### Буфер фото хранится в памяти
+Буфер фото хранится в **Upstash Redis** — REST-based Redis, который работает на любой serverless-платформе.
 
-Vercel serverless functions — stateless. Буфер фото (`Map` по `chat_id`) живёт только пока функция «тёплая». При холодном старте (после нескольких минут бездействия) буфер сбрасывается.
+### Настройка
 
-**На практике это значит:** если отправить фото, подождать 5-10 минут и нажать `/done` — буфер может оказаться пуст.
+**Вариант 1 — через Vercel Marketplace (проще):**
+1. Зайди в [Vercel Marketplace](https://vercel.com/marketplace?category=storage&search=redis)
+2. Установи Upstash Redis integration
+3. Переменные `UPSTASH_REDIS_REST_URL` и `UPSTASH_REDIS_REST_TOKEN` добавятся автоматически
 
-**Рекомендация для продакшена:** заменить `Map` на внешнее хранилище:
-- [Vercel KV](https://vercel.com/docs/storage/vercel-kv) (Redis-совместимое, встроено в Vercel)
-- Upstash Redis
-- Любой внешний Redis
+**Вариант 2 — вручную:**
+1. Зарегистрируйся на [console.upstash.com](https://console.upstash.com)
+2. Создай бесплатную Redis-базу (free tier: 10k запросов/день)
+3. Скопируй `UPSTASH_REDIS_REST_URL` и `UPSTASH_REDIS_REST_TOKEN` из дашборда
+4. Добавь их в Vercel env или в `.env` для локальной разработки
 
-Замена минимальная — нужно переписать функции `getBuffer`, `clearBuffer` и хранение `lastResults` на async-обращения к KV.
+### Зачем Redis?
+
+Vercel serverless functions — stateless. Каждый webhook-запрос может попасть в отдельный инстанс. Без внешнего хранилища фото, отправленное в одном запросе, будет потеряно к моменту `/done` в следующем.
 
 ## Команды бота
 

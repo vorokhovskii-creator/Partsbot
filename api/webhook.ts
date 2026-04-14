@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { Telegraf, Context } from "telegraf";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { Redis } from "@upstash/redis";
 import { Update, Message } from "telegraf/types";
 
 // ---------------------------------------------------------------------------
@@ -15,39 +16,71 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL!;
 // Clients
 // ---------------------------------------------------------------------------
 
-export const bot = new Telegraf(BOT_TOKEN);
-export const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+const bot = new Telegraf(BOT_TOKEN);
+const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+const redis = Redis.fromEnv(); // uses UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN
 
 // ---------------------------------------------------------------------------
-// In-memory state (resets on cold start — see README)
+// Redis keys
 // ---------------------------------------------------------------------------
 
-/** Per-chat buffer of Telegram file_id's awaiting /done */
-const photoBuffers = new Map<number, string[]>();
+const bufferKey = (chatId: number) => `partsbot:buffer:${chatId}`;
+const resultKey = (chatId: number) => `partsbot:result:${chatId}`;
+const lockKey = (chatId: number) => `partsbot:lock:${chatId}`;
 
-/** Debounce timers for media-group batching */
-const mediaGroupTimers = new Map<string, NodeJS.Timeout>();
-const mediaGroupBatches = new Map<string, { chatId: number; fileIds: string[] }>();
+// TTL for stored data (1 hour — more than enough for a session)
+const TTL_SECONDS = 3600;
 
-/** Stores the last extracted plain text per chat so "copy" button can resend */
-const lastResults = new Map<number, string>();
+// ---------------------------------------------------------------------------
+// Buffer helpers (Redis-backed)
+// ---------------------------------------------------------------------------
+
+async function getBuffer(chatId: number): Promise<string[]> {
+  const data = await redis.get<string[]>(bufferKey(chatId));
+  return data ?? [];
+}
+
+async function pushToBuffer(chatId: number, ...fileIds: string[]): Promise<number> {
+  const buf = await getBuffer(chatId);
+  buf.push(...fileIds);
+  await redis.set(bufferKey(chatId), buf, { ex: TTL_SECONDS });
+  return buf.length;
+}
+
+async function clearBuffer(chatId: number): Promise<void> {
+  await redis.del(bufferKey(chatId));
+}
+
+async function popBuffer(chatId: number): Promise<string[]> {
+  const buf = await getBuffer(chatId);
+  await redis.del(bufferKey(chatId));
+  return buf;
+}
+
+async function setLastResult(chatId: number, text: string): Promise<void> {
+  await redis.set(resultKey(chatId), text, { ex: TTL_SECONDS });
+}
+
+async function getLastResult(chatId: number): Promise<string | null> {
+  return redis.get<string>(resultKey(chatId));
+}
+
+// Simple lock to prevent double-processing of /done
+async function acquireLock(chatId: number): Promise<boolean> {
+  const result = await redis.set(lockKey(chatId), "1", { nx: true, ex: 30 });
+  return result === "OK";
+}
+
+async function releaseLock(chatId: number): Promise<void> {
+  await redis.del(lockKey(chatId));
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function getBuffer(chatId: number): string[] {
-  if (!photoBuffers.has(chatId)) photoBuffers.set(chatId, []);
-  return photoBuffers.get(chatId)!;
-}
-
-function clearBuffer(chatId: number): void {
-  photoBuffers.delete(chatId);
-}
-
 /** Download a Telegram photo by file_id and return base64 + mime */
 async function downloadPhoto(fileId: string): Promise<{ base64: string; mimeType: string }> {
-  // 1. getFile → file_path
   const fileRes = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
   );
@@ -56,7 +89,6 @@ async function downloadPhoto(fileId: string): Promise<{ base64: string; mimeType
     throw new Error(`getFile failed for ${fileId}`);
   }
 
-  // 2. Download binary
   const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileJson.result.file_path}`;
   const imgRes = await fetch(downloadUrl);
   if (!imgRes.ok) throw new Error(`Failed to download file: ${imgRes.status}`);
@@ -117,7 +149,7 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
 
       if (!isRetryable || attempt === maxAttempts) throw err;
 
-      const delayMs = 3000 * attempt; // 3s, 6s, 9s
+      const delayMs = 3000 * attempt;
       console.log(`Gemini attempt ${attempt} failed (${message}), retrying in ${delayMs}ms...`);
       await new Promise((r) => setTimeout(r, delayMs));
     }
@@ -126,7 +158,6 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
 }
 
 async function processWithGemini(fileIds: string[]): Promise<string> {
-  // Download all photos in parallel
   const photos = await Promise.all(fileIds.map(downloadPhoto));
 
   const model = genAI.getGenerativeModel({
@@ -158,6 +189,13 @@ async function processWithGemini(fileIds: string[]): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Album debounce (in-memory is OK here — only within a single invocation)
+// ---------------------------------------------------------------------------
+
+const mediaGroupTimers = new Map<string, NodeJS.Timeout>();
+const mediaGroupBatches = new Map<string, { chatId: number; fileIds: string[] }>();
+
+// ---------------------------------------------------------------------------
 // Bot handlers
 // ---------------------------------------------------------------------------
 
@@ -175,32 +213,35 @@ bot.start((ctx) => {
   );
 });
 
-bot.command("clear", (ctx) => {
+bot.command("clear", async (ctx) => {
   const chatId = ctx.chat.id;
-  const buf = getBuffer(chatId);
+  const buf = await getBuffer(chatId);
   const count = buf.length;
-  clearBuffer(chatId);
+  await clearBuffer(chatId);
   return ctx.reply(count > 0 ? `Буфер очищен (было ${count} фото).` : "Буфер и так пуст.");
 });
 
 bot.command("done", async (ctx) => {
   const chatId = ctx.chat.id;
-  const buf = getBuffer(chatId);
 
-  if (buf.length === 0) {
-    return ctx.reply("Буфер пуст. Сначала отправь скриншоты.");
+  // Prevent double-processing if Telegram retries or user taps twice
+  const locked = await acquireLock(chatId);
+  if (!locked) {
+    return ctx.reply("Уже обрабатываю, подожди...");
   }
 
-  const fileIds = [...buf];
-  clearBuffer(chatId);
-
-  await ctx.reply(`Обрабатываю ${fileIds.length} фото через AI...`);
-
   try {
-    const text = await processWithGemini(fileIds);
-    lastResults.set(chatId, text);
+    const fileIds = await popBuffer(chatId);
 
-    // Send formatted result with copy button
+    if (fileIds.length === 0) {
+      return ctx.reply("Буфер пуст. Сначала отправь скриншоты.");
+    }
+
+    await ctx.reply(`Обрабатываю ${fileIds.length} фото через AI...`);
+
+    const text = await processWithGemini(fileIds);
+    await setLastResult(chatId, text);
+
     await ctx.reply(`\`\`\`\n${text}\n\`\`\``, {
       parse_mode: "Markdown",
       reply_markup: {
@@ -213,6 +254,8 @@ bot.command("done", async (ctx) => {
     const message = err instanceof Error ? err.message : "Неизвестная ошибка";
     console.error("Gemini error:", message);
     await ctx.reply(`Ошибка при обработке: ${message}\nПопробуй отправить фото заново.`);
+  } finally {
+    await releaseLock(chatId);
   }
 });
 
@@ -223,63 +266,54 @@ bot.action("copy_result", async (ctx) => {
 
   await ctx.answerCbQuery("Скопировано!");
 
-  const text = lastResults.get(chatId);
+  const text = await getLastResult(chatId);
   if (text) {
-    // Send as plain text so user can select & copy on desktop
     await ctx.reply(text);
   }
 });
 
 // Handle photo messages (single and album)
-bot.on("photo", (ctx) => {
+bot.on("photo", async (ctx) => {
   const chatId = ctx.chat.id;
   const photos = ctx.message.photo;
-  // Take the highest resolution (last element)
   const fileId = photos[photos.length - 1].file_id;
   const mediaGroupId = ctx.message.media_group_id;
 
   if (mediaGroupId) {
     // Album mode — debounce 500ms
-    handleAlbumPhoto(chatId, mediaGroupId, fileId, ctx);
+    // In-memory batch is fine here: all photos in an album arrive
+    // as separate webhooks but typically hit the same warm instance
+    // within milliseconds. If they don't, each photo is saved individually.
+    if (!mediaGroupBatches.has(mediaGroupId)) {
+      mediaGroupBatches.set(mediaGroupId, { chatId, fileIds: [] });
+    }
+    mediaGroupBatches.get(mediaGroupId)!.fileIds.push(fileId);
+
+    const existingTimer = mediaGroupTimers.get(mediaGroupId);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    const timer = setTimeout(async () => {
+      try {
+        const batch = mediaGroupBatches.get(mediaGroupId);
+        if (batch) {
+          const newLen = await pushToBuffer(batch.chatId, ...batch.fileIds);
+          await ctx.reply(`Фото добавлено (${newLen}). Отправь ещё или нажми /done`);
+        }
+      } catch (e) {
+        console.error("Album batch error:", e);
+      } finally {
+        mediaGroupBatches.delete(mediaGroupId);
+        mediaGroupTimers.delete(mediaGroupId);
+      }
+    }, 500);
+
+    mediaGroupTimers.set(mediaGroupId, timer);
   } else {
-    // Single photo
-    const buf = getBuffer(chatId);
-    buf.push(fileId);
-    ctx.reply(`Фото добавлено (${buf.length}). Отправь ещё или нажми /done`);
+    // Single photo — save to Redis immediately
+    const newLen = await pushToBuffer(chatId, fileId);
+    await ctx.reply(`Фото добавлено (${newLen}). Отправь ещё или нажми /done`);
   }
 });
-
-function handleAlbumPhoto(
-  chatId: number,
-  mediaGroupId: string,
-  fileId: string,
-  ctx: Context<Update.MessageUpdate<Message.PhotoMessage>>
-): void {
-  // Accumulate file IDs for this media group
-  if (!mediaGroupBatches.has(mediaGroupId)) {
-    mediaGroupBatches.set(mediaGroupId, { chatId, fileIds: [] });
-  }
-  mediaGroupBatches.get(mediaGroupId)!.fileIds.push(fileId);
-
-  // Clear any existing timer for this group
-  const existingTimer = mediaGroupTimers.get(mediaGroupId);
-  if (existingTimer) clearTimeout(existingTimer);
-
-  // Set debounce timer
-  const timer = setTimeout(() => {
-    const batch = mediaGroupBatches.get(mediaGroupId);
-    if (batch) {
-      const buf = getBuffer(batch.chatId);
-      buf.push(...batch.fileIds);
-      ctx.reply(`Фото добавлено (${buf.length}). Отправь ещё или нажми /done`);
-    }
-    // Cleanup
-    mediaGroupBatches.delete(mediaGroupId);
-    mediaGroupTimers.delete(mediaGroupId);
-  }, 500);
-
-  mediaGroupTimers.set(mediaGroupId, timer);
-}
 
 // ---------------------------------------------------------------------------
 // Webhook setup (runs once per cold start)
@@ -303,7 +337,6 @@ async function ensureWebhook(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Always return 200 to Telegram regardless of internal errors
   try {
     if (req.method !== "POST") {
       res.status(200).json({ ok: true, method: req.method });
@@ -311,8 +344,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     await ensureWebhook();
-
-    // Process the update
     await bot.handleUpdate(req.body as Update);
   } catch (err) {
     console.error("Webhook handler error:", err);
