@@ -12,6 +12,11 @@
       "src": "/api/webhook",
       "methods": ["POST"],
       "dest": "/api/webhook"
+    },
+    {
+      "src": "/api/copy",
+      "methods": ["GET"],
+      "dest": "/api/copy"
     }
   ]
 }
