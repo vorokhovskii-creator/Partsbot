@@ -1,0 +1,23 @@
+{
+  "name": "partsbot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@vercel/node": "^3.2.0",
+    "typescript": "^5.6.0",
+    "vercel": "^37.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
