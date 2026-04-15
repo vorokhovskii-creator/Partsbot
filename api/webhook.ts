@@ -154,6 +154,51 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 4): Promise<T> {
   throw new Error("Unreachable");
 }
 
+const TEXT_SYSTEM_PROMPT = `Ты помощник автомеханика. Твоя задача — извлечь информацию о запчастях из текста (скопированного с сайта поставщика или программы закупки) и отформатировать в строго заданный вид для Google Таблиц.
+
+ФОРМАТ ВЫВОДА:
+Одна строка на каждую уникальную запчасть.
+Каждая строка: [название запчасти]\\t[варианты через \\]
+
+Каждый вариант цены: ЦЕНА*КОЛ-ВОПоставщикИлиБренд
+- ЦЕНА — розничная цена в рублях, только цифры без пробелов и знака ₽
+- КОЛ-ВО — количество (если не указано — 1)
+- ПоставщикИлиБренд — краткое название без пробелов (zfrussia, nibk, Bosch, FILTRON и т.п.)
+
+ПРИМЕР ВЫВОДА (разделитель между колонками — Tab):
+передние тормозные диски\t8500*2zfrussia\\10800*2nibk
+фильтр топливный\t1190*1LYNX\\1230*1Bosch\\1310*1FILTRON\\2020*1EUROREPAR\\3230*1MANN
+
+ПРАВИЛА:
+- Бери ТОЛЬКО розничную цену (не закупочную/себестоимость)
+- Если видны колонки "Цена розница" и "Цена закупочная" — бери "Цена розница"
+- Если текст с сайта поставщика — бери указанную цену как есть
+- Включай ВСЕ варианты поставщиков/брендов из текста
+- Убирай пробелы и знак ₽ из цен
+- Только строки в указанном формате, без пояснений и вступлений
+- Несколько разных запчастей — каждую отдельной строкой
+- Разделитель между названием и ценами — строго символ табуляции (\\t)
+- Если в тексте нет данных о запчастях и ценах — ответь: НЕ_НАШЁЛ_ЗАПЧАСТЕЙ`;
+
+async function processTextWithGemini(userText: string): Promise<string> {
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.5-flash",
+    systemInstruction: TEXT_SYSTEM_PROMPT,
+  });
+
+  return withRetry(async () => {
+    const result = await model.generateContent([
+      { text: `Извлеки данные о запчастях из следующего текста:\n\n${userText}` },
+    ]);
+
+    const t = result.response.text();
+    if (!t || t.trim().length === 0) {
+      throw new Error("Gemini вернул пустой ответ");
+    }
+    return t.trim().replace(/\\t/g, "\t");
+  });
+}
+
 async function processWithGemini(fileIds: string[]): Promise<string> {
   const photos = await Promise.all(fileIds.map(downloadPhoto));
 
@@ -198,12 +243,13 @@ async function handleUpdate(update: any): Promise<void> {
   if (text === "/start") {
     await sendMessage(
       chatId,
-      "Привет! Я помогу извлечь цены запчастей со скриншотов.\n\n" +
+      "Привет! Я помогу извлечь цены запчастей со скриншотов или текста.\n\n" +
         "Как пользоваться:\n" +
         "1. Отправь один или несколько скриншотов с ценами\n" +
         "2. Я подтвержу получение каждого фото\n" +
         "3. Когда все фото отправлены — нажми /done\n" +
         "4. Я обработаю их через AI и выдам таблицу для вставки в Google Sheets\n\n" +
+        "Или просто отправь текст, скопированный со страницы с ценами — я обработаю его через AI.\n\n" +
         "Команды:\n" +
         "/done — обработать накопленные скриншоты\n" +
         "/clear — очистить буфер без обработки"
@@ -278,6 +324,52 @@ async function handleUpdate(update: any): Promise<void> {
     const newLen = await pushToBuffer(chatId, fileId);
     console.log(`Photo from ${chatId}: file_id=${fileId}, buffer now ${newLen}`);
     await sendMessage(chatId, `Фото добавлено (${newLen}). Отправь ещё или нажми /done`);
+    return;
+  }
+
+  // Freeform text — process through Gemini as parts data
+  if (text && !text.startsWith("/")) {
+    await sendMessage(chatId, "Обрабатываю текст через AI...");
+
+    try {
+      const result = await processTextWithGemini(text);
+
+      if (result.includes("НЕ_НАШЁЛ_ЗАПЧАСТЕЙ")) {
+        await sendMessage(chatId, "Не удалось найти данные о запчастях в этом тексте. Отправь текст с ценами запчастей.");
+        return;
+      }
+
+      await setLastResult(chatId, result);
+
+      const preview = result
+        .split("\n")
+        .map((line) => {
+          const [name, prices] = line.split("\t");
+          return prices ? `${name}  |  ${prices}` : line;
+        })
+        .join("\n");
+
+      const copyUrl = `${WEBHOOK_URL}/api/copy?id=${chatId}`;
+
+      await sendMessage(
+        chatId,
+        `Готово!\n\n${preview}\n\nДля вставки в Google Sheets:`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "\u{1F4CB} Скопировать для Google Sheets", url: copyUrl }],
+            ],
+          },
+        }
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Неизвестная ошибка";
+      console.error("Gemini text error:", message);
+      await sendMessage(
+        chatId,
+        `Ошибка при обработке текста: ${message}\nПопробуй отправить текст заново.`
+      );
+    }
     return;
   }
 }
